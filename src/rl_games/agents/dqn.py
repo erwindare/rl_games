@@ -285,6 +285,55 @@ class DQNAgent(BaseAgent):
 
     # ── training loop ─────────────────────────────────────────────────
 
+    def _save_learning_curve(self, rewards_history: list[float]) -> None:
+        if not rewards_history:
+            return
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        output_dir = Path("graficos")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        env_name = self.env_id.replace("/", "_").replace(":", "_")
+        output_path = output_dir / (
+            f"dqn_learning_curve_{env_name}_{len(rewards_history)}_episodes.png"
+        )
+
+        episodes = np.arange(1, len(rewards_history) + 1)
+        window = min(10, len(rewards_history))
+        moving_average = np.convolve(
+            rewards_history, np.ones(window) / window, mode="valid"
+        )
+
+        figure, axis = plt.subplots(figsize=(10, 6))
+        axis.plot(
+            episodes,
+            rewards_history,
+            alpha=0.45,
+            label="Recompensa por episodio",
+        )
+        axis.plot(
+            episodes[window - 1 :],
+            moving_average,
+            linewidth=2,
+            label=f"Promedio móvil ({window} episodios)",
+        )
+        axis.set(
+            title=f"Curva de aprendizaje DQN - {self.env_id}",
+            xlabel="Episodio",
+            ylabel="Recompensa total",
+        )
+        axis.grid(True, alpha=0.3)
+        axis.legend()
+        figure.tight_layout()
+        try:
+            figure.savefig(output_path, dpi=150)
+        finally:
+            plt.close(figure)
+        print(f"Gráfica de aprendizaje guardada en {output_path}")
+
     def train(self, total_episodes: int = 500, log_interval: int = 10) -> list[float]:
         env = envs.make(self.env_id)
         rewards_history: list[float] = []
@@ -326,6 +375,7 @@ class DQNAgent(BaseAgent):
             )
 
         env.close()
+        self._save_learning_curve(rewards_history)
         return rewards_history
 
     # ── persistence ───────────────────────────────────────────────────

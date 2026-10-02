@@ -29,6 +29,9 @@ El comando crea un checkpoint nuevo o reanuda uno existente:
 uv run rlgames train dqn --episodes 500
 ```
 
+Al terminar, se genera una gráfica PNG con la recompensa por episodio y su
+promedio móvil en `graficos/dqn_learning_curve_ALE_Breakout-v5_NNN_episodes.png`.
+
 ## Evaluar y renderizar
 
 La evaluación calcula recompensas en 10 episodios. El render abre la ventana
