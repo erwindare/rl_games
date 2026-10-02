@@ -26,7 +26,6 @@ SAVE_DIR = Path("saves")
 
 # agent key -> ("module:Class", save-file extension). Adding an agent = a row.
 AGENTS: dict[str, tuple[str, str]] = {
-    "qlearning": ("rl_games.agents.qlearning:QLearningAgent", ".pkl"),
     "dqn": ("rl_games.agents.dqn:DQNAgent", ".pt"),
 }
 

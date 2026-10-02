@@ -1,12 +1,12 @@
 """Deep Q-Network (DQN) in PyTorch.
 
 Contents:
-  - QNetwork     : fully-connected network mapping state -> Q(s, a)
+    - QNetwork     : vector MLP or image CNN mapping state -> Q(s, a)
   - ReplayBuffer : fixed-size FIFO buffer of (s, a, r, s', done) transitions
   - DQNAgent     : epsilon-greedy policy, training loop, target-network sync,
                    and save/load
 
-QNetwork and parts of DQNAgent are exercises; see CHEATSHEET.md.
+Supports vector observations and preprocessed Atari frame stacks.
 """
 import random
 from collections import deque
@@ -21,31 +21,65 @@ import torch.optim as optim
 from rl_games import envs
 from rl_games.agents.base import BaseAgent
 
+DEFAULT_LR = 2.5e-4
+DEFAULT_BATCH_SIZE = 32
+DQN_CONFIG_VERSION = 2
+
+
+def _select_device() -> torch.device:
+    """Use CUDA when the installed PyTorch build can access it."""
+    if torch.cuda.is_available():
+        return torch.device("cuda:0")
+    return torch.device("cpu")
+
 
 # ── Neural network ────────────────────────────────────────────────────
 
 
 class QNetwork(nn.Module):
-    """Maps a state to one Q-value per action.
+    """Map vector or stacked image observations to one Q-value per action."""
 
-    Two hidden layers is the standard baseline for LunarLander-sized
-    problems: enough capacity to matter, small enough to train on CPU.
-    """
-
-    def __init__(self, state_dim: int, action_dim: int, hidden: int = 128) -> None:
+    def __init__(
+        self, state_dim: int | tuple[int, ...], action_dim: int, hidden: int = 128
+    ) -> None:
         super().__init__()
-        # EXERCISE: build the network.
-        #   - input is `state_dim` wide, output is `action_dim` wide, because
-        #     the net returns one Q-value per action in a single forward pass
-        #   - `hidden` units in between, with a nonlinearity after each
-        #     hidden layer (without one you have a linear model)
-        #   - no activation on the output: Q-values are unbounded
-        raise NotImplementedError("QNetwork.__init__ -- see CHEATSHEET.md")
+        self.is_image = isinstance(state_dim, tuple)
+        if self.is_image:
+            if len(state_dim) != 3 or state_dim[0] != 4:
+                raise ValueError(
+                    "Image observations must have shape (4, height, width); "
+                    f"got {state_dim}."
+                )
+            self.features = nn.Sequential(
+                nn.Conv2d(4, 32, kernel_size=8, stride=4),
+                nn.ReLU(),
+                nn.Conv2d(32, 64, kernel_size=4, stride=2),
+                nn.ReLU(),
+                nn.Conv2d(64, 64, kernel_size=3, stride=1),
+                nn.ReLU(),
+                nn.Flatten(),
+            )
+            with torch.no_grad():
+                feature_dim = self.features(torch.zeros(1, *state_dim)).shape[1]
+            self.head = nn.Sequential(
+                nn.Linear(feature_dim, hidden),
+                nn.ReLU(),
+                nn.Linear(hidden, action_dim),
+            )
+        else:
+            self.network = nn.Sequential(
+                nn.Linear(state_dim, hidden),
+                nn.ReLU(),
+                nn.Linear(hidden, hidden),
+                nn.ReLU(),
+                nn.Linear(hidden, action_dim),
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Q-values for a batch of states, shape (batch, action_dim)."""
-        # EXERCISE: run `x` through the layers defined in __init__.
-        raise NotImplementedError("QNetwork.forward -- see CHEATSHEET.md")
+        if self.is_image:
+            return self.head(self.features(x.float() / 255.0))
+        return self.network(x.float())
 
 
 # ── Replay buffer ────────────────────────────────────────────────────
@@ -55,7 +89,15 @@ class ReplayBuffer:
     """Fixed-size FIFO buffer that stores transitions for experience replay."""
 
     def __init__(self, capacity: int = 100_000) -> None:
+        self.capacity = capacity
         self.buffer: deque[tuple] = deque(maxlen=capacity)
+        self._image_states: np.ndarray | None = None
+        self._image_next_frames: np.ndarray | None = None
+        self._image_actions: np.ndarray | None = None
+        self._image_rewards: np.ndarray | None = None
+        self._image_dones: np.ndarray | None = None
+        self._image_position = 0
+        self._image_size = 0
 
     def push(
         self,
@@ -65,12 +107,60 @@ class ReplayBuffer:
         next_state: np.ndarray,
         done: bool,
     ) -> None:
+        state_array = np.asarray(state)
+        if state_array.ndim == 3:
+            next_state_array = np.asarray(next_state)
+            if state_array.shape != next_state_array.shape:
+                raise ValueError("Image state and next state must have matching shapes.")
+            if self._image_states is None:
+                self._image_states = np.empty(
+                    (self.capacity, *state_array.shape), dtype=np.uint8
+                )
+                self._image_next_frames = np.empty(
+                    (self.capacity, *state_array.shape[1:]), dtype=np.uint8
+                )
+                self._image_actions = np.empty(self.capacity, dtype=np.int64)
+                self._image_rewards = np.empty(self.capacity, dtype=np.float32)
+                self._image_dones = np.empty(self.capacity, dtype=np.bool_)
+
+            index = self._image_position
+            self._image_states[index] = state_array
+            self._image_next_frames[index] = next_state_array[-1]
+            self._image_actions[index] = action
+            self._image_rewards[index] = reward
+            self._image_dones[index] = done
+            self._image_position = (index + 1) % self.capacity
+            self._image_size = min(self._image_size + 1, self.capacity)
+            return
+
         self.buffer.append((state, action, reward, next_state, done))
 
     def sample(self, batch_size: int) -> list[tuple]:
+        if self._image_states is not None:
+            assert self._image_next_frames is not None
+            assert self._image_actions is not None
+            assert self._image_rewards is not None
+            assert self._image_dones is not None
+            indices = np.random.choice(self._image_size, size=batch_size, replace=False)
+            states = self._image_states[indices]
+            next_states = np.concatenate(
+                (states[:, 1:], self._image_next_frames[indices, np.newaxis]), axis=1
+            )
+            return [
+                (
+                    states[batch_index],
+                    self._image_actions[slot],
+                    self._image_rewards[slot],
+                    next_states[batch_index],
+                    self._image_dones[slot],
+                )
+                for batch_index, slot in enumerate(indices)
+            ]
         return random.sample(self.buffer, batch_size)
 
     def __len__(self) -> int:
+        if self._image_states is not None:
+            return self._image_size
         return len(self.buffer)
 
 
@@ -91,13 +181,13 @@ class DQNAgent(BaseAgent):
         self,
         env_id: str,
         *,
-        lr: float = 1e-3,
+        lr: float = DEFAULT_LR,
         gamma: float = 0.99,
         epsilon_start: float = 1.0,
         epsilon_end: float = 0.01,
         epsilon_decay: float = 0.995,
-        batch_size: int = 64,
-        buffer_capacity: int = 100_000,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        buffer_capacity: int | None = None,
         target_update_freq: int = 10,
         hidden: int = 128,
     ) -> None:
@@ -113,18 +203,32 @@ class DQNAgent(BaseAgent):
         self.target_update_freq = target_update_freq
 
         env = envs.make(env_id)
-        self.state_dim = env.observation_space.shape[0]
-        self.action_dim = int(env.action_space.n)  # type: ignore[attr-defined]
-        env.close()
+        try:
+            state_shape = tuple(env.observation_space.shape)
+            self.state_dim: int | tuple[int, ...] = (
+                state_shape if len(state_shape) == 3 else state_shape[0]
+            )
+            self.action_dim = int(env.action_space.n)  # type: ignore[attr-defined]
+        finally:
+            env.close()
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.is_image = isinstance(self.state_dim, tuple)
+        if buffer_capacity is None:
+            buffer_capacity = 10_000 if self.is_image else 100_000
+        self.buffer_capacity = buffer_capacity
+
+        self.device = _select_device()
+        if self.device.type == "cuda":
+            print(f"Using GPU: {torch.cuda.get_device_name(self.device)}")
+        else:
+            print("CUDA unavailable; using CPU")
 
         self.q_net = QNetwork(self.state_dim, self.action_dim, hidden).to(self.device)
         self.target_net = QNetwork(self.state_dim, self.action_dim, hidden).to(self.device)
         self.target_net.load_state_dict(self.q_net.state_dict())
 
         self.optimizer = optim.Adam(self.q_net.parameters(), lr=lr)
-        self.loss_fn = nn.MSELoss()
+        self.loss_fn = nn.SmoothL1Loss()
         self.buffer = ReplayBuffer(buffer_capacity)
 
     # ── policy ────────────────────────────────────────────────────────
@@ -136,11 +240,12 @@ class DQNAgent(BaseAgent):
         `deterministic`), otherwise pick argmax of the online network's
         Q-values.
         """
-        # EXERCISE: implement epsilon-greedy over self.q_net.
-        #   - wrap the forward pass in torch.no_grad(): this is inference, so
-        #     there is no need to build a graph
-        #   - the net expects a batch dimension, a single state does not have one
-        raise NotImplementedError("DQNAgent.select_action -- see CHEATSHEET.md")
+        if not deterministic and random.random() < self.epsilon:
+            return random.randrange(self.action_dim)
+
+        state_tensor = torch.as_tensor(state, device=self.device).unsqueeze(0)
+        with torch.no_grad():
+            return int(self.q_net(state_tensor).argmax(dim=1).item())
 
     # ── learning step ─────────────────────────────────────────────────
 
@@ -152,16 +257,31 @@ class DQNAgent(BaseAgent):
         if len(self.buffer) < self.batch_size:
             return 0.0
 
-        # EXERCISE: one DQN gradient step.
-        #   1. sample a batch and turn each column into a tensor on self.device
-        #   2. current Q: self.q_net(states), keeping only the actions taken
-        #      (torch.gather does this)
-        #   3. target Q: r + gamma * max_a' Q_target(s', a') * (1 - done).
-        #      Use the TARGET network here, under torch.no_grad(), and note
-        #      the (1 - done) factor -- a terminal state has no future reward
-        #   4. self.loss_fn(current, target), then zero_grad / backward / step
-        #   5. return loss.item()
-        raise NotImplementedError("DQNAgent._learn -- see CHEATSHEET.md")
+        batch = self.buffer.sample(self.batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+        state_tensor = torch.as_tensor(np.stack(states), device=self.device)
+        action_tensor = torch.as_tensor(
+            actions, dtype=torch.long, device=self.device
+        ).unsqueeze(1)
+        reward_tensor = torch.as_tensor(
+            rewards, dtype=torch.float32, device=self.device
+        )
+        next_state_tensor = torch.as_tensor(np.stack(next_states), device=self.device)
+        done_tensor = torch.as_tensor(
+            dones, dtype=torch.float32, device=self.device
+        )
+
+        current_q = self.q_net(state_tensor).gather(1, action_tensor).squeeze(1)
+        with torch.no_grad():
+            next_q = self.target_net(next_state_tensor).max(dim=1).values
+            target_q = reward_tensor + self.gamma * next_q * (1 - done_tensor)
+
+        loss = self.loss_fn(current_q, target_q)
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=10.0)
+        self.optimizer.step()
+        return float(loss.item())
 
     # ── training loop ─────────────────────────────────────────────────
 
@@ -197,14 +317,13 @@ class DQNAgent(BaseAgent):
             if episode % self.target_update_freq == 0:
                 self.target_net.load_state_dict(self.q_net.state_dict())
 
-            if episode % log_interval == 0:
-                self._log_episode(
-                    episode,
-                    total_episodes,
-                    rewards_history,
-                    log_interval,
-                    f"Buffer: {len(self.buffer)}",
-                )
+            self._log_episode(
+                episode,
+                total_episodes,
+                rewards_history,
+                log_interval,
+                f"Buffer: {len(self.buffer)}",
+            )
 
         env.close()
         return rewards_history
@@ -228,27 +347,38 @@ class DQNAgent(BaseAgent):
             "epsilon_end": self.epsilon_end,
             "epsilon_decay": self.epsilon_decay,
             "batch_size": self.batch_size,
+            "buffer_capacity": self.buffer_capacity,
             "target_update_freq": self.target_update_freq,
+            "dqn_config_version": DQN_CONFIG_VERSION,
         }
         torch.save(data, path)
         print(f"Saved {self.label} agent to {path}")
 
     @classmethod
     def load(cls, path: Path) -> Self:
-        data = torch.load(path, weights_only=False)
+        data = torch.load(path, map_location="cpu", weights_only=False)
+        config_version = data.get("dqn_config_version", 1)
         agent = cls(
             data["env_id"],
-            lr=data["lr"],
+            lr=data["lr"] if config_version >= DQN_CONFIG_VERSION else DEFAULT_LR,
             gamma=data["gamma"],
-            epsilon_start=data["epsilon"],
+            epsilon_start=data.get("epsilon_start", 1.0),
             epsilon_end=data["epsilon_end"],
             epsilon_decay=data["epsilon_decay"],
-            batch_size=data["batch_size"],
+            batch_size=(
+                data["batch_size"]
+                if config_version >= DQN_CONFIG_VERSION
+                else DEFAULT_BATCH_SIZE
+            ),
+            buffer_capacity=data.get("buffer_capacity"),
             target_update_freq=data["target_update_freq"],
         )
         agent.q_net.load_state_dict(data["q_net_state"])
         agent.target_net.load_state_dict(data["target_net_state"])
         agent.optimizer.load_state_dict(data["optimizer_state"])
+        for parameter_group in agent.optimizer.param_groups:
+            parameter_group["lr"] = agent.lr
+        agent.epsilon = data["epsilon"]
         agent.training_episodes = data["training_episodes"]
         return agent
 

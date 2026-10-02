@@ -19,7 +19,7 @@ def run_episodes(
 ) -> list[float]:
     """Run `n_episodes` greedily and return each episode's total reward."""
     returns = []
-    for _ in range(n_episodes):
+    for episode in range(1, n_episodes + 1):
         obs, _ = env.reset()
         done, total = False, 0.0
         while not done:
@@ -28,4 +28,5 @@ def run_episodes(
             done = terminated or truncated
             total += reward
         returns.append(total)
+        print(f"Evaluation episode {episode}/{n_episodes} | Reward: {total:.2f}")
     return returns

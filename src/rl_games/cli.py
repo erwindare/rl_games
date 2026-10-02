@@ -26,6 +26,15 @@ VERSION = version("rl_games")
 # ── commands ─────────────────────────────────────────────────────────
 
 
+def _format_observation(observation: np.ndarray) -> str:
+    if observation.ndim == 3:
+        return (
+            f"shape={observation.shape}, dtype={observation.dtype}, "
+            f"range=[{observation.min()}, {observation.max()}]"
+        )
+    return np.array2string(observation, precision=3)
+
+
 def cmd_inspect(args: argparse.Namespace) -> None:
     env_id = args.env
     env = envs.make(env_id)
@@ -33,7 +42,7 @@ def cmd_inspect(args: argparse.Namespace) -> None:
     print(f"Environment: {env_id}\n")
     print(f"Observation space : {env.observation_space}")
     print(f"  shape           : {env.observation_space.shape}")
-    if hasattr(env.observation_space, "low"):
+    if len(env.observation_space.shape) == 1:
         print(f"  low             : {env.observation_space.low}")
         print(f"  high            : {env.observation_space.high}")
     print(f"\nAction space      : {env.action_space}")
@@ -44,7 +53,7 @@ def cmd_inspect(args: argparse.Namespace) -> None:
     n = args.steps
     print(f"\n-- Sample transitions ({n} steps, random policy) --\n")
     obs, info = env.reset()
-    print(f"  Initial state: {np.array2string(obs, precision=3)}")
+    print(f"  Initial state: {_format_observation(obs)}")
     print()
 
     for step in range(1, n + 1):
@@ -55,12 +64,12 @@ def cmd_inspect(args: argparse.Namespace) -> None:
             f"  step {step:>3} | action={action} | "
             f"reward={reward:+.3f} | done={done}"
         )
-        print(f"           state -> {np.array2string(next_obs, precision=3)}")
+        print(f"           state -> {_format_observation(next_obs)}")
         obs = next_obs
         if done:
             print("           [episode ended, resetting]")
             obs, info = env.reset()
-            print(f"           state -> {np.array2string(obs, precision=3)}")
+            print(f"           state -> {_format_observation(obs)}")
         print()
 
     env.close()
@@ -129,7 +138,7 @@ def cmd_sim(args: argparse.Namespace) -> None:
         step = 0
 
         print(f"== Episode {ep}/{args.episodes} ==\n")
-        print(f"  initial state: {np.array2string(obs, precision=3)}\n")
+        print(f"  initial state: {_format_observation(obs)}\n")
 
         limit = args.steps  # None means show all
 
@@ -147,7 +156,7 @@ def cmd_sim(args: argparse.Namespace) -> None:
                     f"reward={reward:+8.3f} | total={total_reward:+9.2f}"
                 )
                 if args.verbose:
-                    print(f"           state -> {np.array2string(next_obs, precision=3)}")
+                    print(f"           state -> {_format_observation(next_obs)}")
 
             obs = next_obs
 
@@ -177,8 +186,7 @@ def cmd_render(args: argparse.Namespace) -> None:
     agent = registry.load(args.agent, args.env)
     env = envs.make(args.env, render_mode="human")
 
-    for ep, total_reward in enumerate(evaluate.run_episodes(agent, env, n_episodes=args.episodes), 1):
-        print(f"Episode {ep}/{args.episodes} | Reward: {total_reward:.2f}")
+    evaluate.run_episodes(agent, env, n_episodes=args.episodes)
 
     env.close()
 
@@ -194,8 +202,7 @@ def cmd_list(args: argparse.Namespace) -> None:
         status = "saved" if path.exists() else "no save"
         print(f"  {agent:<14} [{status}]  {path}")
 
-    print(f"\nEnvs with hand-written bounds: {', '.join(envs.OBS_BOUNDS)}")
-    print("Others work too if their observation space is bounded.")
+    print(f"\nEnvironment: {args.env}")
 
 
 # ── argument parser ──────────────────────────────────────────────────
@@ -204,7 +211,7 @@ def cmd_list(args: argparse.Namespace) -> None:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="rlgames",
-        description="Train and evaluate RL agents on Gymnasium environments",
+        description="Train, evaluate, and render a DQN agent on Atari Breakout",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -213,7 +220,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "--env",
             type=str,
             default=ENV_ID,
-            help=f"Gymnasium env ID (default: {ENV_ID})",
+            choices=(ENV_ID,),
+            help=f"Only supported environment (default: {ENV_ID})",
         )
 
     # version
